@@ -1256,6 +1256,7 @@ dependencies = [
  "config",
  "futures",
  "h3ron",
+ "helium-crypto",
  "helium-proto",
  "http",
  "itertools",

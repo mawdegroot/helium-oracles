@@ -1,7 +1,9 @@
 use crate::{
     entropy::ENTROPY_LIFESPAN,
     gateway_cache::GatewayCache,
+    helius::GatewayInfo,
     last_beacon::{LastBeacon, LastBeaconError},
+    region_cache::RegionCache,
 };
 use chrono::{DateTime, Duration, Utc};
 use density_scaler::HexDensityMap;
@@ -14,9 +16,8 @@ use h3ron::{to_geo::ToCoordinate, H3Cell, H3DirectedEdge, Index};
 use helium_crypto::PublicKeyBinary;
 use helium_proto::{
     services::poc_lora::{InvalidParticipantSide, InvalidReason, VerificationStatus},
-    GatewayStakingMode, Region,
+    Region,
 };
-use node_follower::gateway_resp::GatewayInfo;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::f64::consts::PI;
@@ -48,7 +49,7 @@ pub struct VerifyBeaconResult {
 pub struct VerifyWitnessResult {
     result: VerificationStatus,
     invalid_reason: InvalidReason,
-    pub gateway_info: Option<GatewayInfo>,
+    gateway_info: Option<GatewayInfo>,
     hex_scale: Option<Decimal>,
     participant_side: InvalidParticipantSide,
 }
@@ -93,7 +94,7 @@ impl Poc {
 
     pub async fn verify_beacon(
         &mut self,
-        hex_density_map: impl HexDensityMap,
+        hex_density_map: &impl HexDensityMap,
         gateway_cache: &GatewayCache,
         pool: &PgPool,
         beacon_interval: Duration,
@@ -138,8 +139,9 @@ impl Poc {
     pub async fn verify_witnesses(
         &mut self,
         beacon_info: &GatewayInfo,
-        hex_density_map: impl HexDensityMap,
+        hex_density_map: &impl HexDensityMap,
         gateway_cache: &GatewayCache,
+        region_cache: &RegionCache,
     ) -> Result<VerifyWitnessesResult, VerificationError> {
         let mut verified_witnesses: Vec<IotVerifiedWitnessReport> = Vec::new();
         let mut failed_witnesses: Vec<IotInvalidWitnessReport> = Vec::new();
@@ -150,7 +152,8 @@ impl Poc {
                     &witness_report,
                     beacon_info,
                     gateway_cache,
-                    &hex_density_map,
+                    region_cache,
+                    hex_density_map,
                 )
                 .await
             {
@@ -195,6 +198,7 @@ impl Poc {
         witness_report: &IotWitnessIngestReport,
         beaconer_info: &GatewayInfo,
         gateway_cache: &GatewayCache,
+        region_cache: &RegionCache,
         hex_density_map: &impl HexDensityMap,
     ) -> Result<VerifyWitnessResult, VerificationError> {
         let witness = &witness_report.report;
@@ -206,9 +210,22 @@ impl Poc {
                 return Ok(VerifyWitnessResult::gateway_not_found());
             }
         };
+        //get region data for beaconer and witness, required by verifications
+        let beaconer_region = self
+            .get_gateway_region_info(region_cache, &beaconer_info.address)
+            .await;
+        let witness_region = self
+            .get_gateway_region_info(region_cache, &witness_pub_key)
+            .await;
         // run the witness verifications
         match self
-            .do_witness_verifications(&witness_info, witness_report, beaconer_info)
+            .do_witness_verifications(
+                &witness_info,
+                witness_report,
+                beaconer_info,
+                beaconer_region,
+                witness_region,
+            )
             .await
         {
             Ok(()) => {
@@ -237,7 +254,7 @@ impl Poc {
     ) -> GenericVerifyResult {
         tracing::debug!(
             "verifying beacon from beaconer: {:?}",
-            PublicKeyBinary::from(beaconer_info.address.clone())
+            beaconer_info.address.clone()
         );
         let beacon_received_ts = self.beacon_report.received_timestamp;
         verify_entropy(self.entropy_start, self.entropy_end, beacon_received_ts)?;
@@ -248,10 +265,10 @@ impl Poc {
             beacon_interval_tolerance,
         )?;
         verify_gw_location(beaconer_info.location)?;
-        verify_gw_capability(beaconer_info.staking_mode)?;
+        verify_gw_capability(beaconer_info.is_full_hotspot)?;
         tracing::debug!(
             "valid beacon from beaconer: {:?}",
-            PublicKeyBinary::from(beaconer_info.address.clone())
+            beaconer_info.address.clone()
         );
         Ok(())
     }
@@ -261,10 +278,12 @@ impl Poc {
         witness_info: &GatewayInfo,
         witness_report: &IotWitnessIngestReport,
         beaconer_info: &GatewayInfo,
+        beaconer_region: Option<Region>,
+        witness_region: Option<Region>,
     ) -> GenericVerifyResult {
         tracing::debug!(
             "verifying witness from gateway: {:?}",
-            PublicKeyBinary::from(witness_info.address.clone())
+            witness_info.address.clone()
         );
         let beacon_report = &self.beacon_report;
         verify_self_witness(
@@ -282,7 +301,7 @@ impl Poc {
             beacon_report.report.frequency,
             witness_report.report.frequency,
         )?;
-        verify_witness_region(beaconer_info.region, witness_info.region)?;
+        verify_witness_region(beaconer_region, witness_region)?;
         verify_witness_distance(beaconer_info.location, witness_info.location)?;
         verify_witness_rssi(
             witness_report.report.signal,
@@ -294,7 +313,7 @@ impl Poc {
         )?;
         tracing::debug!(
             "valid witness from gateway: {:?}",
-            PublicKeyBinary::from(witness_info.address.clone())
+            witness_info.address.clone()
         );
         Ok(())
     }
@@ -356,6 +375,17 @@ impl Poc {
             report: witness_report.report,
             participant_side: InvalidParticipantSide::Witness,
         })
+    }
+
+    async fn get_gateway_region_info(
+        &self,
+        region_cache: &RegionCache,
+        address: &PublicKeyBinary,
+    ) -> Option<Region> {
+        match region_cache.resolve_region_info(address).await {
+            Ok(res) => Some(res.region),
+            Err(_e) => None,
+        }
     }
 }
 
@@ -424,19 +454,10 @@ fn verify_gw_location(gateway_loc: Option<u64>) -> GenericVerifyResult {
 }
 
 /// verify gateway is permitted to participate in POC
-fn verify_gw_capability(staking_mode: GatewayStakingMode) -> GenericVerifyResult {
-    match staking_mode {
-        GatewayStakingMode::Dataonly => {
-            tracing::debug!(
-                "witness verification failed, reason: {:?}. gateway staking mode: {:?}",
-                InvalidReason::InvalidCapability,
-                staking_mode
-            );
-            return Err(InvalidReason::InvalidCapability);
-        }
-        GatewayStakingMode::Full => (),
-        GatewayStakingMode::Light => (),
-    }
+fn verify_gw_capability(is_full_hotspot: bool) -> GenericVerifyResult {
+    if !is_full_hotspot {
+        return Err(InvalidReason::InvalidCapability);
+    };
     Ok(())
 }
 
@@ -469,11 +490,18 @@ fn verify_witness_freq(beacon_freq: u64, witness_freq: u64) -> GenericVerifyResu
 }
 
 /// verify the witness is located in same region as beaconer
-fn verify_witness_region(beacon_region: Region, witness_region: Region) -> GenericVerifyResult {
-    if beacon_region != witness_region {
+fn verify_witness_region(
+    beacon_region: Option<Region>,
+    witness_region: Option<Region>,
+) -> GenericVerifyResult {
+    let r1 = beacon_region.ok_or(InvalidReason::InvalidRegion)?;
+    let r2 = witness_region.ok_or(InvalidReason::InvalidRegion)?;
+    if r1 != r2 {
         tracing::debug!(
-            "witness verification failed, reason: {:?}. beaconer region: {beacon_region}, witness region: {witness_region}",
-            InvalidReason::InvalidRegion
+            "witness verification failed, reason: {:?}. beaconer region: {:?}, witness region: {:?}",
+            InvalidReason::InvalidRegion,
+            beacon_region,
+            witness_region,
         );
         return Err(InvalidReason::InvalidRegion);
     }
@@ -510,7 +538,7 @@ fn verify_witness_rssi(
     witness_signal: i32,
     witness_freq: u64,
     beacon_tx_power: i32,
-    beacon_gain: i32,
+    beacon_gain: Option<i32>,
     beacon_loc: Option<u64>,
     witness_loc: Option<u64>,
 ) -> GenericVerifyResult {
@@ -521,18 +549,19 @@ fn verify_witness_rssi(
     // then default this verification to a fail
     let l1 = beacon_loc.ok_or(InvalidReason::BadRssi)?;
     let l2 = witness_loc.ok_or(InvalidReason::BadRssi)?;
+    let gain = beacon_gain.ok_or(InvalidReason::BadRssi)?;
     let distance = match calc_distance(l1, l2) {
         Ok(d) => d,
         Err(_) => return Err(InvalidReason::BadRssi),
     };
-    let min_rcv_signal = calc_fspl(beacon_tx_power, witness_freq, distance, beacon_gain);
+    let min_rcv_signal = calc_fspl(beacon_tx_power, witness_freq, distance, gain);
     // signal is submitted as DBM * 10
     // min_rcv_signal    is plain old DBM
     if witness_signal / 10 > min_rcv_signal as i32 {
         tracing::debug!(
             "witness verification failed, reason: {:?}
             beaconer tx_power: {beacon_tx_power},
-            beaconer gain: {beacon_gain},
+            beaconer gain: {gain},
             witness signal: {witness_signal},
             witness freq: {witness_freq},
             min_rcv_signal: {min_rcv_signal}",
@@ -715,6 +744,16 @@ impl VerifyWitnessResult {
             InvalidParticipantSide::Witness,
         )
     }
+
+    pub fn no_region() -> Self {
+        Self::new(
+            VerificationStatus::Invalid,
+            InvalidReason::InvalidRegion,
+            None,
+            None,
+            InvalidParticipantSide::Witness,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -722,7 +761,7 @@ mod tests {
     use super::*;
     use crate::last_beacon::LastBeacon;
     use chrono::Duration;
-    use helium_proto::{services::poc_lora::InvalidReason, GatewayStakingMode, Region};
+    use helium_proto::services::poc_lora::InvalidReason;
     use std::str::FromStr;
 
     #[test]
@@ -845,11 +884,10 @@ mod tests {
 
     #[test]
     fn test_verify_capability() {
-        assert!(verify_gw_capability(GatewayStakingMode::Full).is_ok());
-        assert!(verify_gw_capability(GatewayStakingMode::Light).is_ok());
+        assert!(verify_gw_capability(true).is_ok());
         assert_eq!(
             Err(InvalidReason::InvalidCapability),
-            verify_gw_capability(GatewayStakingMode::Dataonly)
+            verify_gw_capability(false)
         );
     }
 
@@ -888,9 +926,9 @@ mod tests {
 
     #[test]
     fn test_verify_witness_region() {
-        let beacon_region = Region::Us915;
-        let witness1_region = Region::Us915;
-        let witness2_region = Region::Eu868;
+        let beacon_region = Some(Region::Us915);
+        let witness1_region = Some(Region::Us915);
+        let witness2_region = Some(Region::Eu868);
         assert!(verify_witness_region(beacon_region, witness1_region).is_ok());
         assert_eq!(
             Err(InvalidReason::InvalidRegion),
@@ -919,7 +957,7 @@ mod tests {
         let witness2_loc = 631278052025960447; // armenia
 
         let beacon1_tx_power = 27;
-        let beacon1_gain = 80;
+        let beacon1_gain = Some(80);
         let witness1_signal = -1060;
         let witness1_freq = 904700032;
         assert!(verify_witness_rssi(
@@ -932,7 +970,7 @@ mod tests {
         )
         .is_ok());
         let beacon2_tx_power = 27;
-        let beacon2_gain = 12;
+        let beacon2_gain = Some(12);
         let witness2_signal = -19;
         let witness2_freq = 904499968;
         assert_eq!(
