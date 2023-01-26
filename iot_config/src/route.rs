@@ -7,7 +7,7 @@ use helium_proto::Region;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{types::Uuid, Row};
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 use tokio::sync::broadcast::{self, Sender};
 
 pub mod proto {
@@ -101,7 +101,7 @@ pub enum RouteStorageError {
 pub async fn create_route(
     route: Route,
     db: impl sqlx::PgExecutor<'_> + sqlx::Acquire<'_, Database = sqlx::Postgres> + Copy,
-    update_tx: Arc<Sender<proto::RouteStreamResV1>>,
+    update_tx: Sender<proto::RouteStreamResV1>,
 ) -> Result<Route, RouteStorageError> {
     let net_id: i64 = route.net_id.into();
     let protocol_opts = route
@@ -154,7 +154,7 @@ pub async fn create_route(
 pub async fn update_route(
     route: Route,
     db: impl sqlx::PgExecutor<'_> + sqlx::Acquire<'_, Database = sqlx::Postgres> + Copy,
-    update_tx: Arc<Sender<proto::RouteStreamResV1>>,
+    update_tx: Sender<proto::RouteStreamResV1>,
 ) -> Result<Route, RouteStorageError> {
     let protocol_opts = route
         .server
@@ -250,7 +250,7 @@ pub async fn modify_euis(
     action: proto::RouteEuisActionV1,
     euis: &[Eui],
     db: impl sqlx::PgExecutor<'_> + sqlx::Acquire<'_, Database = sqlx::Postgres> + Copy,
-    update_tx: Arc<Sender<proto::RouteStreamResV1>>,
+    update_tx: Sender<proto::RouteStreamResV1>,
 ) -> Result<(), RouteStorageError> {
     let mut transaction = db.begin().await?;
 
@@ -335,7 +335,7 @@ pub async fn modify_devaddr_ranges(
     action: proto::RouteDevaddrsActionV1,
     devaddr_ranges: &[DevAddrRange],
     db: impl sqlx::PgExecutor<'_> + sqlx::Acquire<'_, Database = sqlx::Postgres> + Copy,
-    update_tx: Arc<Sender<proto::RouteStreamResV1>>,
+    update_tx: Sender<proto::RouteStreamResV1>,
 ) -> Result<(), RouteStorageError> {
     let mut transaction = db.begin().await?;
 
@@ -510,7 +510,7 @@ pub async fn get_route(
 pub async fn delete_route(
     id: &str,
     db: impl sqlx::PgExecutor<'_> + sqlx::Acquire<'_, Database = sqlx::Postgres> + Copy,
-    update_tx: Arc<Sender<proto::RouteStreamResV1>>,
+    update_tx: Sender<proto::RouteStreamResV1>,
 ) -> Result<(), RouteStorageError> {
     let uuid = Uuid::try_parse(id)?;
     let mut transaction = db.begin().await?;
