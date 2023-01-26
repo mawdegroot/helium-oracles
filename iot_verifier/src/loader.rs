@@ -26,8 +26,6 @@ use twox_hash::XxHash64;
 use xorf::{Filter as XorFilter, Xor16};
 
 const REPORTS_META_NAME: &str = "report";
-/// cadence for how often to look for  reports from s3 buckets
-const REPORTS_POLL_TIME: u64 = 60 * 5;
 
 const STORE_WORKERS: usize = 100;
 // DB pool size if the store worker count multiplied by the number of file types
@@ -37,6 +35,9 @@ const LOADER_DB_POOL_SIZE: usize = STORE_WORKERS * 4;
 pub struct Loader {
     ingest_store: FileStore,
     pool: PgPool,
+    poll_time: time::Duration,
+    window_width: ChronoDuration,
+    max_lookback_age: ChronoDuration,
     deny_list_latest_url: String,
     deny_list_trigger_interval: Duration,
     deny_list: DenyList,
@@ -63,10 +64,16 @@ impl Loader {
         tracing::info!("from_settings verifier loader");
         let pool = settings.database.connect(LOADER_DB_POOL_SIZE).await?;
         let ingest_store = FileStore::from_settings(&settings.ingest).await?;
+        let poll_time = settings.poc_loader_poll_time();
+        let window_width = settings.poc_loader_window_width();
+        let max_lookback_age = settings.poc_loader_window_max_lookback_age();
         let deny_list = DenyList::new()?;
         Ok(Self {
             pool,
             ingest_store,
+            poll_time,
+            window_width,
+            max_lookback_age,
             deny_list_latest_url: settings.denylist.denylist_url.clone(),
             deny_list_trigger_interval: settings.denylist.trigger_interval(),
             deny_list,
@@ -79,7 +86,7 @@ impl Loader {
         gateway_cache: &GatewayCache,
     ) -> anyhow::Result<()> {
         tracing::info!("started verifier loader");
-        let mut report_timer = time::interval(time::Duration::from_secs(REPORTS_POLL_TIME));
+        let mut report_timer = time::interval(self.poll_time);
         report_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut denylist_timer = time::interval(self.deny_list_trigger_interval);
         denylist_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -129,23 +136,21 @@ impl Loader {
         tracing::info!("handling report tick");
         let now = Utc::now();
         // the loader loads files from s3 via a sliding window
-        // the window defaults to a width = REPORTS_POLL_TIME
-        // its start point is Now() - (REPORTS_POLL_TIME * 2)
-        // as such data being loaded is always stale by a time equal to REPORTS_POLL_TIME
-
-        // if there is NO last timestamp in the DB, we will start our sliding window from this point
-        let window_default_lookback = now - ChronoDuration::seconds(REPORTS_POLL_TIME as i64 * 3);
-        // NOTE: Atm we never look back more than window_default_lookback
-        // The experience has been that once we start processing a window longer than default
-        // we never recover the time and end up stuck on a window of the extended size
-        // The option is here however to extend the window size should it be needed
-        let window_max_lookback = now - ChronoDuration::seconds(REPORTS_POLL_TIME as i64 * 3);
+        // if there is no last timestamp in the meta db, the window start point will be
+        // Now() - (window_width * 3)
+        // as such data loading is always behind by a value equal to window_width * 2
+        let window_default_lookback = now - (self.window_width * 3);
+        // cap the starting point of the window at the max below.
+        let window_max_lookback = now - self.max_lookback_age;
+        tracing::info!(
+            "default window: {window_default_lookback}, max window: {window_max_lookback}"
+        );
         let after = Meta::last_timestamp(&self.pool, REPORTS_META_NAME)
             .await?
             .unwrap_or(window_default_lookback)
             .max(window_max_lookback);
-
-        let before = now - ChronoDuration::seconds(REPORTS_POLL_TIME as i64 * 2);
+        let before_max = after + self.window_width;
+        let before = (now - (self.window_width * 2)).min(before_max);
         let window_width = (before - after).num_minutes() as u64;
         tracing::info!("sliding window, after: {after}, before: {before}, width: {window_width}");
         self.process_window(gateway_cache, after, before).await?;
@@ -199,15 +204,15 @@ impl Loader {
         // process the witnesses
         // widen the window for these over that used for the beacons
         // this is to allow for a witness being in a rolled up file
-        // from just before or after the beacon files
+        // from before or after the beacon files
         // for witnesses we do need the filter but not the arc
         match self
             .process_events(
                 FileType::IotWitnessIngestReport,
                 &self.ingest_store,
                 gateway_cache,
-                after - ChronoDuration::seconds(60 * 2),
-                before + ChronoDuration::seconds(60 * 2),
+                after - ChronoDuration::seconds(60 * 5),
+                before + ChronoDuration::seconds(60 * 5),
                 None,
                 Some(&filter),
             )
