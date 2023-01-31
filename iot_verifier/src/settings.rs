@@ -44,7 +44,7 @@ pub struct Settings {
     /// window width for the poc report loader ( in seconds )
     /// each poll the loader will load reports from start time to start time + window width
     /// NOTE: the window width should be as a minimum equal to the ingestor roll up period
-    ///       any less and the verifier will potentially miss incoming reports
+    ///       any less and the verifier will potentially miss incoming
     #[serde(default = "default_poc_loader_window_width")]
     pub poc_loader_window_width: i64,
     /// cadence for how often to look for poc reports from s3 buckets

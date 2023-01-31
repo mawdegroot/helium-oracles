@@ -44,9 +44,10 @@ const HIP15_TX_REWARD_UNIT_CAP: Decimal = Decimal::TWO;
 
 pub struct Runner {
     pool: PgPool,
-    settings: Settings,
+    cache: String,
     beacon_interval: ChronoDuration,
     beacon_interval_tolerance: ChronoDuration,
+    max_witnesses_per_poc: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -62,13 +63,16 @@ pub enum RunnerError {
 impl Runner {
     pub async fn from_settings(settings: &Settings) -> Result<Self, NewRunnerError> {
         let pool = settings.database.connect(RUNNER_DB_POOL_SIZE).await?;
+        let cache = settings.cache.clone();
         let beacon_interval = settings.beacon_interval();
         let beacon_interval_tolerance = settings.beacon_interval_tolerance();
+        let max_witnesses_per_poc = settings.max_witnesses_per_poc;
         Ok(Self {
             pool,
-            settings: settings.clone(),
+            cache,
             beacon_interval,
             beacon_interval_tolerance,
+            max_witnesses_per_poc,
         })
     }
 
@@ -84,7 +88,7 @@ impl Runner {
         let mut db_timer = time::interval(DB_POLL_TIME);
         db_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        let store_base_path = Path::new(&self.settings.cache);
+        let store_base_path = Path::new(&self.cache);
 
         let (iot_invalid_beacon_sink, mut iot_invalid_beacon_sink_server) =
             file_sink::FileSinkBuilder::new(
@@ -386,7 +390,7 @@ impl Runner {
         let beacon_id = valid_beacon_report.report.report_id(received_timestamp);
         let packet_data = valid_beacon_report.report.data.clone();
         let beacon_report_id = valid_beacon_report.report.report_id(received_timestamp);
-        let max_witnesses_per_poc = self.settings.max_witnesses_per_poc as usize;
+        let max_witnesses_per_poc = self.max_witnesses_per_poc as usize;
         let mut selected_witnesses = witnesses_result.verified_witnesses;
         let unselected_witnesses = shuffle_and_split_witnesses(
             &beacon_id,

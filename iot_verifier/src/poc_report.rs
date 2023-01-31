@@ -354,7 +354,7 @@ impl Report {
 
     pub async fn get_stale_beacons<'c, E>(
         executor: E,
-        stale_period: i64,
+        stale_period: Duration,
     ) -> Result<Vec<Self>, ReportError>
     where
         E: sqlx::Executor<'c, Database = sqlx::Postgres>,
@@ -367,7 +367,7 @@ impl Report {
         // if the entropy is not there the beacon will never be processed
         // Such beacons will eventually be handled by the purger and failed there
         // stale beacon reports, for this reason, are determined solely based on time
-        let stale_time = Utc::now() - Duration::seconds(stale_period);
+        let stale_time = Utc::now() - stale_period;
         Ok(sqlx::query_as::<_, Self>(
             r#"
             select * from poc_report
@@ -396,7 +396,7 @@ impl Report {
 
     pub async fn get_stale_witnesses<'c, E>(
         executor: E,
-        stale_period: i64,
+        stale_period: Duration,
     ) -> Result<Vec<Self>, ReportError>
     where
         E: sqlx::Executor<'c, Database = sqlx::Postgres>,
@@ -408,7 +408,7 @@ impl Report {
         // as the verifier processes beacon reports and then pulls witness reports
         // linked to current beacon being processed
         // stale witness reports, for this reason, are determined solely based on time
-        let stale_time = Utc::now() - Duration::seconds(stale_period);
+        let stale_time = Utc::now() - stale_period;
         Ok(sqlx::query_as::<_, Self>(
             r#"
             select * from poc_report
