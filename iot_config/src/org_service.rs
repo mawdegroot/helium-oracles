@@ -193,16 +193,19 @@ impl iot_config::Org for OrgService {
 
             for route in org_routes {
                 let route_id = route.id.clone();
-                self.route_update_tx
+                if self
+                    .route_update_tx
                     .send(RouteStreamResV1 {
                         action: ActionV1::Delete.into(),
                         route: Some(route.into()),
                     })
-                    .map_err(|_| {
-                        Status::internal(format!(
-                            "failed updating routers with deleted route: {route_id}"
-                        ))
-                    })?;
+                    .is_err()
+                {
+                    tracing::info!(
+                        "all subscribers disconnected; route disable failed at route {route_id}"
+                    );
+                    break;
+                };
                 tracing::debug!("updated packet routers with removed route: {route_id}");
             }
         }
@@ -233,16 +236,19 @@ impl iot_config::Org for OrgService {
 
             for route in org_routes {
                 let route_id = route.id.clone();
-                self.route_update_tx
+                if self
+                    .route_update_tx
                     .send(RouteStreamResV1 {
                         action: ActionV1::Create.into(),
                         route: Some(route.into()),
                     })
-                    .map_err(|_| {
-                        Status::internal(format!(
-                            "failed updating routers with created route: {route_id}"
-                        ))
-                    })?;
+                    .is_err()
+                {
+                    tracing::info!(
+                        "all subscribers disconnected; route enable failed at route {route_id}"
+                    );
+                    break;
+                };
                 tracing::debug!("updated packet routers with recreated route: {route_id}");
             }
         }
